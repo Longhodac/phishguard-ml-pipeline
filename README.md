@@ -1,5 +1,4 @@
-# End-to-End MLOps Pipeline for Phishing Detection
-
+# phishguard-ml-pipeline
 ## Overview
 
 This project implements a complete machine learning operations pipeline for detecting phishing websites. The goal is to build a production-ready system that can automatically train, validate, and deploy models to identify malicious URLs. The entire workflow is containerized and includes cloud integration for scalability and proper experiment tracking for reproducibility.
