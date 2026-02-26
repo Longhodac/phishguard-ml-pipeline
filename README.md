@@ -16,6 +16,80 @@ The motivation behind building this as an MLOps pipeline rather than just a stan
 
 ## Project Architecture
 
+### System Architecture (High-Level)
+
+```mermaid
+flowchart TB
+    subgraph External["External Services"]
+        MongoDB[(MongoDB)]
+        S3[(AWS S3)]
+        MLflow[DagShub / MLflow]
+        ECR[AWS ECR]
+    end
+
+    subgraph CI["CI/CD"]
+        GitHub[GitHub Actions]
+        Docker[Docker Build]
+        GitHub --> Docker
+        Docker --> ECR
+    end
+
+    subgraph App["PhishGuard Application"]
+        API[FastAPI API]
+        API --> |/train| Pipeline[Training Pipeline]
+        API --> |/predict| Inference[Inference Engine]
+    end
+
+    subgraph Pipeline["Training Pipeline"]
+        direction TB
+        DI[Data Ingestion]
+        DV[Data Validation]
+        DT[Data Transformation]
+        MT[Model Trainer]
+        S3Sync[S3 Sync]
+        DI --> DV --> DT --> MT --> S3Sync
+    end
+
+    MongoDB --> |export data| DI
+    MT --> |log experiments| MLflow
+    S3Sync --> |artifacts & models| S3
+    Inference --> |load| S3
+```
+
+### Training Pipeline Flow
+
+```mermaid
+flowchart LR
+    subgraph Stage1["1. Data Ingestion"]
+        A[MongoDB] --> B[Export to DataFrame]
+        B --> C[Train/Test Split 80/20]
+        C --> D[Feature Store]
+    end
+
+    subgraph Stage2["2. Data Validation"]
+        D --> E[Schema Check]
+        E --> F[Drift Detection]
+        F --> G[Validation Report]
+    end
+
+    subgraph Stage3["3. Data Transformation"]
+        G --> H[KNN Imputation]
+        H --> I[Preprocessor Pipeline]
+        I --> J[Training Data]
+    end
+
+    subgraph Stage4["4. Model Training"]
+        J --> K[GridSearchCV]
+        K --> L[MLflow Logging]
+        L --> M[Best Model]
+        M --> N[Artifacts + S3]
+    end
+```
+
+> **Note:** The diagrams above use [Mermaid](https://mermaid.js.org/). They render automatically on GitHub, GitLab, and in many Markdown viewers.
+
+### Component Overview
+
 The pipeline follows a modular design with four main stages:
 
 ### 1. Data Ingestion
