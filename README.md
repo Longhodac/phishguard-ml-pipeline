@@ -219,6 +219,60 @@ The FastAPI application provides two main endpoints:
 
 Predictions are returned both as downloadable CSV files and as HTML tables for easy viewing. The API is CORS-enabled, allowing it to be called from web applications.
 
+## Project Overview: Beginning to End
+
+This section walks through the full lifecycle of the system and the main design choices.
+
+### End-to-End Flow
+
+1. **Data loading (optional, one-time or periodic)**  
+   Raw phishing/legit URL data lives in `Network_Data/phisingData.csv`. The script `push_data.py` converts this CSV to JSON and inserts it into MongoDB (database `LHODAC`, collection `NetworkData`). This gives a single source of truth that the pipeline can pull from on each run.
+
+2. **Triggering a training run**  
+   Training can be started in two ways:  
+   - **CLI:** `python main.py` runs the four stages locally via the same components used by the API.  
+   - **API:** `GET /train` instantiates `TrainingPipeline` and calls `run_pipeline()`, which runs the same sequence.
+
+3. **Pipeline execution (four stages + sync)**  
+   - **Data ingestion:** Connects to MongoDB, exports the collection to a DataFrame, normalizes `"na"` to NaN, writes a feature-store CSV and train/test CSVs (80% train, 20% test). Paths are under a timestamped directory in `Artifacts/`.  
+   - **Data validation:** Loads the schema from `data_schema/schema.yaml` (31 columns, all `int64`). Checks that train and test have the expected number of columns. Runs drift detection between train and test using the Kolmogorov–Smirnov test per column (threshold p-value 0.05); writes a drift report YAML. Valid (and optionally invalid) data paths are recorded in `DataValidationArtifact`.  
+   - **Data transformation:** Drops the target column `Result`, maps target -1→0, builds a scikit-learn `Pipeline` with a single step—`KNNImputer` (k=3, `missing_values=np.nan`, `weights="uniform"`). Fits on train, transforms train and test, saves `.npy` arrays and the preprocessor object. The same preprocessor is also saved to `final_model/preprocessor.pkl` so the API can load it for inference.  
+   - **Model training:** Loads the `.npy` arrays, splits into X/y. Trains five classifiers (Random Forest, Decision Tree, Gradient Boosting, Logistic Regression, AdaBoost) with `GridSearchCV` (3-fold CV) and model-specific param grids. Selection is by **test R²** (best test score wins). Logs to MLflow (DagShub): metrics (F1, precision, recall) and the best model artifact. Saves the best model and a `NetworkModel` (preprocessor + model) to the run’s artifact dir and to `final_model/model.pkl`.  
+   - **S3 sync:** Uploads the timestamped artifact directory and the final model directory to the configured S3 bucket (`long-networksecurity`) for backup and versioning.
+
+4. **Inference**  
+   `POST /predict` expects a CSV with the same feature columns (no target). It loads `final_model/preprocessor.pkl` and `final_model/model.pkl`, wraps them in `NetworkModel`, runs preprocessor transform then model predict, adds a `predicted_column` to the DataFrame, writes `prediction_output/output.csv`, and returns an HTML table (Jinja2 template) for display.
+
+5. **CI/CD**  
+   On push to `main` (excluding README-only changes), GitHub Actions runs a lint/test job, then builds a Docker image and pushes it to AWS ECR. Optional deployment (e.g. pull and run on a self-hosted runner) is present but commented out.
+
+### Key Design Decisions
+
+| Area | Choice | Rationale |
+|------|--------|-----------|
+| **Data source** | MongoDB for training data | Central, queryable store; separates raw data from pipeline code. CSV is loaded once via `push_data.py`, then the pipeline always reads from MongoDB. |
+| **Train/test split** | 80/20, single split | Simple and reproducible; no time-based requirement for this dataset. Ratio is configurable via `DATA_INGESTION_TRAIN_TEST_SPLIT_RATION` (0.2). |
+| **Schema** | YAML with 31 columns, all int64 | Single source of truth for validation; easy to extend. Column list is used to check count; drift uses the same features. |
+| **Missing values** | KNN imputation (k=3) | Preserves structure better than mean/median for mixed feature types; small k keeps it local. Parameters in `DATA_TRANSFORMATION_IMPUTER_PARAMS`. |
+| **Transformed data format** | NumPy `.npy` for train/test | Fast load in training; preprocessor is the only object needed at inference, so CSV is not required after transformation. |
+| **Model selection** | Best test R² among five classifiers | R² used in `evaluate_models` to pick the best model; classification metrics (F1, precision, recall) are logged to MLflow for analysis. |
+| **Hyperparameter tuning** | GridSearchCV, 3-fold CV | Built-in, reproducible; 3-fold keeps runtime reasonable while still tuning. Param grids are per model in `model_trainer.py`. |
+| **Experiment tracking** | MLflow + DagShub | Remote, shareable runs; models and metrics in one place. DagShub is initialized in the trainer so all runs log there. |
+| **Production model path** | `final_model/` + S3 | `final_model/` is the live dir the API reads from; S3 holds timestamped copies for rollback and auditing. |
+| **Inference interface** | FastAPI, CSV upload, HTML table response | CSV matches the feature-table format; HTML gives a quick way to view results without parsing JSON. |
+| **Pipeline structure** | Config entities + artifact entities + components | Clear separation: config holds paths and parameters, artifacts hold outputs of each stage, components are stateless and testable. |
+| **Orchestration** | `TrainingPipeline` in `training_pipeline.py` | Single class that wires configs, runs the four stages in order, and performs S3 sync. Same flow for CLI and API. |
+| **Errors** | `NetworkSecurityException` with file/line | Consistent error handling and easier debugging; used across components. |
+
+### Implementation Details
+
+- **Config:** All paths and constants are centralized in `networksecurity/constant/training_pipeline` and the `*Config` classes in `config_entity.py`. Each run gets a timestamp (`%m_%d_%Y_%H_%M_%S`) so artifact dirs don’t overwrite.  
+- **Artifacts:** Each stage returns a dataclass (e.g. `DataIngestionArtifact`, `DataValidationArtifact`) with file paths and status; the next stage takes the previous artifact so the pipeline is explicit and traceable.  
+- **Validation:** Drift is detected per column with `scipy.stats.ks_2samp`; drift report is a YAML of p-values and drift flags. Currently valid data is always written to the validated paths; invalid data paths exist in the artifact but are not yet populated with separate invalid rows.  
+- **Target encoding:** The schema and code use `Result`; -1 is normalized to 0 so the target is strictly 0/1 for binary classification.  
+- **Model packaging:** The API uses the raw preprocessor and model pickles and builds `NetworkModel` at request time; the trainer saves both the raw model and a `NetworkModel` instance in artifact dirs for consistency.  
+- **Env vars:** Ingestion uses `MONGO_DB_URL`; the FastAPI app in `app.py` uses `MONGODB_URL_KEY` for its MongoDB client. Both must be set if you use the API and the pipeline against the same DB.
+
 ## Setup and Installation
 
 ### Prerequisites
